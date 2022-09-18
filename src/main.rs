@@ -1,17 +1,24 @@
-use axum::{
-    http::{Request, StatusCode},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
-};
+use axum::http::Request;
+use axum::http::StatusCode;
+use axum::middleware;
+use axum::middleware::Next;
+use axum::response::IntoResponse;
+use axum::response::Response;
+use axum::routing::get;
+use axum::Json;
+use axum::Router;
+
 use clap::Parser;
+use lazy_static::lazy_static;
+use regex::Regex;
 use serde_json::json;
 
 use axum::extract::Path;
 use std::net::SocketAddr;
+use tokio::net::UdpSocket;
 
-use chrono::{prelude::*, Duration};
+use chrono::prelude::*;
+use chrono::Duration;
 
 use std::str::FromStr;
 
@@ -31,6 +38,12 @@ struct Args {
 
     #[clap(long, default_value = "")]
     auth_pass: String,
+
+    #[clap(long, default_value = "")]
+    source_rcon_pass: String,
+
+    #[clap(long, default_value = "localhost:27015")]
+    source_rcon_address: String,
 }
 
 #[tokio::main]
@@ -39,7 +52,7 @@ async fn main() {
 
     let mut app = Router::new();
     app = app.route("/", get(root));
-    app = app.route("/rcon", get(check_rcon));
+    app = app.route("/source-rcon/:name", get(|path| check_source_rcon(path, args.source_rcon_address, args.source_rcon_pass)));
     app = app.route("/service/:name", get(check_service));
     app = app.route("/docker/:name", get(check_docker));
     app = app.fallback(get(notfound));
@@ -82,8 +95,8 @@ async fn check_docker(Path(name): Path<String>) -> impl IntoResponse {
     let out_started_at: String;
 
     {
-        let (mut cmd, cmdstr) = cmd("docker", vec!("inspect", "-f", "{{.State.Status}}", container_name));
-    
+        let (mut cmd, cmdstr) = cmd("docker", vec!["inspect", "-f", "{{.State.Status}}", container_name]);
+
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -134,7 +147,7 @@ async fn check_docker(Path(name): Path<String>) -> impl IntoResponse {
             );
         }
 
-        if stderr != "" {
+        if !stderr.is_empty() {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
@@ -164,8 +177,8 @@ async fn check_docker(Path(name): Path<String>) -> impl IntoResponse {
     }
 
     {
-        let (mut cmd, cmdstr) = cmd("docker", vec!("inspect", "-f", "{{.State.StartedAt}}", container_name));
-    
+        let (mut cmd, cmdstr) = cmd("docker", vec!["inspect", "-f", "{{.State.StartedAt}}", container_name]);
+
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -216,7 +229,7 @@ async fn check_docker(Path(name): Path<String>) -> impl IntoResponse {
             );
         }
 
-        if stderr != "" {
+        if !stderr.is_empty() {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
@@ -230,19 +243,20 @@ async fn check_docker(Path(name): Path<String>) -> impl IntoResponse {
         }
 
         let started_at = match DateTime::parse_from_rfc3339(&stdout) {
-            Err(e) => 
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "cmd": cmdstr,
-                    "error": "STARTEDAT_PARSE",
-                    "info": "docker-inspect returned an invalid StartedAt value",
-                    "value": stdout,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "err": format!("{}", e),
-                })),
-            ),
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "cmd": cmdstr,
+                        "error": "STARTEDAT_PARSE",
+                        "info": "docker-inspect returned an invalid StartedAt value",
+                        "value": stdout,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "err": format!("{}", e),
+                    })),
+                )
+            }
             Ok(v) => DateTime::<Utc>::from(v),
         };
 
@@ -268,15 +282,15 @@ async fn check_docker(Path(name): Path<String>) -> impl IntoResponse {
     }
 
     return (
-        StatusCode::OK, 
+        StatusCode::OK,
         Json(json!({
-            "container_name": container_name, 
-            "status": out_status, 
-            "uptime": out_uptime, 
-            "started_at": out_started_at,
-        }
-    )))
-
+                "container_name": container_name,
+                "status": out_status,
+                "uptime": out_uptime,
+                "started_at": out_started_at,
+            }
+        )),
+    );
 }
 
 async fn check_service(Path(name): Path<String>) -> impl IntoResponse {
@@ -292,8 +306,9 @@ async fn check_service(Path(name): Path<String>) -> impl IntoResponse {
         "--property=Id",
     );
     
+
     let (mut cmd, cmdstr) = cmd("systemctl", cmdargs);
-    
+
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
@@ -344,7 +359,7 @@ async fn check_service(Path(name): Path<String>) -> impl IntoResponse {
         );
     }
 
-    if stderr != "" {
+    if !stderr.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
@@ -365,33 +380,37 @@ async fn check_service(Path(name): Path<String>) -> impl IntoResponse {
 
     for pline in stdout.lines() {
         match pline.split_once('=') {
-            None => return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "cmd": cmdstr,
-                    "error": "SYSCTL_PARSE",
-                    "info": "failed to parse systemctl-show output",
-                    "line": pline,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                })),
-            ),
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "cmd": cmdstr,
+                        "error": "SYSCTL_PARSE",
+                        "info": "failed to parse systemctl-show output",
+                        "line": pline,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    })),
+                )
+            }
             Some(("ActiveState", v)) => svc_active_state = v.to_owned(),
             Some(("ActiveEnterTimestamp", v)) => svc_active_enter_timestamp = v.to_owned(),
             Some(("Type", v)) => svc_type = v.to_owned(),
             Some(("MainPID", v)) => svc_main_pid = v.to_owned(),
             Some(("Id", v)) => svc_id = v.to_owned(),
-            _ => return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "cmd": cmdstr,
-                    "error": "SYSCTL_PARSE",
-                    "info": "failed to parse systemctl-show output",
-                    "line": pline,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                })),
-            ),
+            _ => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "cmd": cmdstr,
+                        "error": "SYSCTL_PARSE",
+                        "info": "failed to parse systemctl-show output",
+                        "line": pline,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    })),
+                )
+            }
         }
     }
 
@@ -410,44 +429,49 @@ async fn check_service(Path(name): Path<String>) -> impl IntoResponse {
     }
 
     let active_enter = match NaiveDateTime::parse_from_str(&svc_active_enter_timestamp, "%a %Y-%m-%d %H:%M:%S %Z") {
-        Err(e) => 
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "cmd": cmdstr,
-                "error": "ACTIVEENTER_PARSE",
-                "info": "systemctl-show returned an invalid ActiveEnterTimestamp value",
-                "value": svc_active_enter_timestamp,
-                "stdout": stdout,
-                "stderr": stderr,
-                "err": format!("{}", e),
-            })),
-        ),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "cmd": cmdstr,
+                    "error": "ACTIVEENTER_PARSE",
+                    "info": "systemctl-show returned an invalid ActiveEnterTimestamp value",
+                    "value": svc_active_enter_timestamp,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "err": format!("{}", e),
+                })),
+            )
+        }
         Ok(v) => match Local.from_local_datetime(&v) {
-            chrono::LocalResult::None => return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "cmd": cmdstr,
-                    "error": "ACTIVEENTER_PARSE",
-                    "info": "systemctl-show returned an unparseable ActiveEnterTimestamp value",
-                    "value": svc_active_enter_timestamp,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                })),
-            ),
-            chrono::LocalResult::Ambiguous(opt1, opt2) => return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "cmd": cmdstr,
-                    "error": "ACTIVEENTER_PARSE",
-                    "info": "systemctl-show returned an ambiguous ActiveEnterTimestamp value",
-                    "value": svc_active_enter_timestamp,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "opt1": opt1.to_rfc3339(),
-                    "opt2": opt2.to_rfc3339(),
-                })),
-            ),
+            chrono::LocalResult::None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "cmd": cmdstr,
+                        "error": "ACTIVEENTER_PARSE",
+                        "info": "systemctl-show returned an unparseable ActiveEnterTimestamp value",
+                        "value": svc_active_enter_timestamp,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    })),
+                )
+            }
+            chrono::LocalResult::Ambiguous(opt1, opt2) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "cmd": cmdstr,
+                        "error": "ACTIVEENTER_PARSE",
+                        "info": "systemctl-show returned an ambiguous ActiveEnterTimestamp value",
+                        "value": svc_active_enter_timestamp,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "opt1": opt1.to_rfc3339(),
+                        "opt2": opt2.to_rfc3339(),
+                    })),
+                )
+            }
             chrono::LocalResult::Single(v) => DateTime::<Utc>::from(v),
         },
     };
@@ -470,27 +494,256 @@ async fn check_service(Path(name): Path<String>) -> impl IntoResponse {
     }
 
     return (
-        StatusCode::OK, 
+        StatusCode::OK,
         Json(json!({
-            "service_name": service_name, 
-            "svc_active_state": svc_active_state,
-            "svc_active_enter_timestamp": svc_active_enter_timestamp,
-            "svc_type": svc_type,
-            "svc_main_pid": svc_main_pid,
-            "svc_id": svc_id,
-            "uptime": uptime.num_seconds(), 
-            "started_at": active_enter.to_rfc3339(),
-        }
-    )))
-
+                "service_name": service_name,
+                "svc_active_state": svc_active_state,
+                "svc_active_enter_timestamp": svc_active_enter_timestamp,
+                "svc_type": svc_type,
+                "svc_main_pid": svc_main_pid,
+                "svc_id": svc_id,
+                "uptime": uptime.num_seconds(),
+                "started_at": active_enter.to_rfc3339(),
+            }
+        )),
+    );
 }
 
-async fn check_rcon() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({ "a": "b" })))
+async fn check_source_rcon(Path(name): Path<String>, address: String, pw: String) -> impl IntoResponse {
+    let server_name = name.as_str();
+
+    let remote_addr: SocketAddr = match address.parse() {
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "remote_addr": address,
+                    "error": "ADDR_PARSE_ERR",
+                    "info": "failed to parse rcon address",
+                    "err": format!("{}", e),
+                })),
+            )
+        }
+        Ok(v) => v,
+    };
+
+    let local_addr_str = if remote_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let local_addr: SocketAddr = local_addr_str.parse().unwrap();
+
+    let socket = match UdpSocket::bind(local_addr).await {
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "remote_addr": address,
+                    "local_addr": local_addr_str,
+                    "error": "BIND_ERR",
+                    "info": "failed to bind local address",
+                    "err": format!("{}", e),
+                })),
+            )
+        }
+        Ok(v) => v,
+    };
+
+    if let Err(e) = socket.connect(&remote_addr).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "remote_addr": address,
+                "local_addr": local_addr_str,
+                "error": "CONN_ERR",
+                "info": "failed to connect to remote",
+                "err": format!("{}", e),
+            })),
+        )
+    }
+
+    let challenge_nonce: String;
+
+    {
+        let cmd_challenge = "####challenge rcon#";
+        let mut data_challenge = cmd_challenge.as_bytes().to_vec();
+        let data_challenge_len = data_challenge.len();
+        data_challenge[0] = 255;
+        data_challenge[1] = 255;
+        data_challenge[2] = 255;
+        data_challenge[3] = 255;
+        data_challenge[data_challenge_len - 1] = 0;
+
+        if let Err(e) = socket.send(&data_challenge).await {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "cmd": cmd_challenge,
+                    "remote_addr": address,
+                    "local_addr": local_addr_str,
+                    "error": "CHALLENGE_ERR",
+                    "info": "failed to send rcon challenge",
+                    "err": format!("{}", e),
+                })),
+            )
+        }
+
+        let mut response_challenge_bin = vec![0u8; 10_000];
+        let response_challenge_len = match socket.recv(&mut response_challenge_bin).await {
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "cmd": cmd_challenge,
+                        "remote_addr": address,
+                        "local_addr": local_addr_str,
+                        "error": "CHALLENGE_ERR",
+                        "info": "failed to receive rcon challenge response",
+                        "err": format!("{}", e),
+                    })),
+                )
+            }
+            Ok(v) => v,
+        };
+
+        let response_challenge = String::from_utf8_lossy(&response_challenge_bin[..response_challenge_len]).into_owned();
+
+        lazy_static! {
+            static ref REX_CHALLENGE_RESPONSE: Regex = Regex::new(".*challenge rcon ([0-9]+).*").unwrap();
+        }
+
+        challenge_nonce = match REX_CHALLENGE_RESPONSE.captures(&response_challenge) {
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "cmd": cmd_challenge,
+                        "remote_addr": address,
+                        "local_addr": local_addr_str,
+                        "error": "NONCE_ERR",
+                        "info": "failed to parse rcon challenge response",
+                        "response": response_challenge,
+                    })),
+                )
+            }
+            Some(v) => match v.get(1) {
+                None => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "cmd": cmd_challenge,
+                            "remote_addr": address,
+                            "local_addr": local_addr_str,
+                            "error": "NONCE_GRP_ERR",
+                            "info": "failed to parse rcon challenge response",
+                            "response": response_challenge,
+                        })),
+                    )
+                }
+                Some(v) => v.as_str().to_owned(),
+            },
+        };
+    }
+
+    let cmd_status = format!(r#"####rcon "{}" {} {}#"#, challenge_nonce, pw, "status");
+    let mut data_status = cmd_status.as_bytes().to_vec();
+    let data_status_len = data_status.len();
+    data_status[0] = 255;
+    data_status[1] = 255;
+    data_status[2] = 255;
+    data_status[3] = 255;
+    data_status[data_status_len - 1] = 0;
+
+    if let Err(e) = socket.send(&data_status).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "cmd": cmd_status,
+                "remote_addr": address,
+                "local_addr": local_addr_str,
+                "error": "CMD_ERR",
+                "info": "failed to send rcon command `status`",
+                "err": format!("{}", e),
+            })),
+        )
+    }
+
+    let mut response_status_bin = vec![0u8; 10_000];
+    if let Err(e) = socket.recv(&mut response_status_bin).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "cmd": cmd_status,
+                "remote_addr": address,
+                "local_addr": local_addr_str,
+                "error": "CMD_RECV_ERR",
+                "info": "failed to receive rcon response",
+                "err": format!("{}", e),
+            })),
+        )
+    }
+
+    let idx = match response_status_bin.iter().position(|&p| p == 0) {
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "cmd": cmd_status,
+                    "remote_addr": address,
+                    "local_addr": local_addr_str,
+                    "error": "CMD_RESP_READ",
+                    "bin": response_status_bin,
+                    "info": "failed to find end of rcon response",
+                })),
+            )
+        }
+        Some(v) => v,
+    };
+
+    let response_status = String::from_utf8_lossy(&response_status_bin[5..idx]).into_owned();
+
+    let mut srv_hostname = "".to_owned();
+    let mut srv_version = "".to_owned();
+    let mut srv_ip = "".to_owned();
+    let mut srv_map = "".to_owned();
+    let mut srv_players = "".to_owned();
+
+    for pline in response_status.lines() {
+        if let Some((k, v)) = pline.split_once(':') {
+            match (k.trim(), v.trim()) {
+                ("hostname", v) => srv_hostname = v.to_owned(),
+                ("version", v) => srv_version = v.to_owned(),
+                ("tcp/ip", v) => srv_ip = v.to_owned(),
+                ("map", v) => srv_map = v.to_owned(),
+                ("players", v) => srv_players = v.trim().to_owned(),
+                _ => {}
+            }
+        }
+    }
+
+    if srv_hostname != server_name {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "SERVERNAME_MISMATCH",
+                "info": "Server returned wrong hostname",
+                "name_should": server_name,
+                "name_actual": srv_hostname,
+            })),
+        );
+    }
+
+    return (
+        StatusCode::OK,
+        Json(json!({
+                "server_hostname": srv_hostname,
+                "server_version": srv_version,
+                "server_ip": srv_ip,
+                "server_map": srv_map,
+                "server_players": srv_players,
+            }
+        )),
+    );
 }
 
 fn cmd(f: &str, args: Vec<&str>) -> (::std::process::Command, String) {
-
     let mut cmdstr = f.to_owned();
 
     let mut command = ::std::process::Command::new(f);
