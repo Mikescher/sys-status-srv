@@ -1,0 +1,11 @@
+[Unit]
+Description=A status webserver for systemd services, docker container and rcon server
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sys-status-srv --ip 127.0.0.1 --port 9663 --auth-user TODO --auth-pass TODO
+Restart=on-failure
+RestartSec=8
+
+[Install]
+WantedBy=multi-user.target
