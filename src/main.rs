@@ -1,3 +1,4 @@
+use axum::body::Body;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::middleware;
@@ -24,7 +25,7 @@ use std::str::FromStr;
 
 use execute::Execute;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[clap()]
 struct Args {
     #[clap(long, default_value = "127.0.0.1")]
@@ -52,9 +53,9 @@ async fn main() {
 
     let mut app = Router::new();
     app = app.route("/", get(root));
-    app = app.route("/source-rcon/:name", get(|path| check_source_rcon(path, args.source_rcon_address, args.source_rcon_pass)));
-    app = app.route("/service/:name", get(check_service));
-    app = app.route("/docker/:name", get(check_docker));
+    app = app.route("/source-rcon/:name", get({let a = args.clone(); move |path, req| check_source_rcon(path, req, a) }));
+    app = app.route("/service/:name", get({let a = args.clone(); move |path, req| check_service(path, req, a) }));
+    app = app.route("/docker/:name", get({let a = args.clone(); move |path, req| check_docker(path, req, a) }));
     app = app.fallback(get(notfound));
     app = app.layer(middleware::from_fn(logger));
 
@@ -87,7 +88,11 @@ async fn notfound() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, r#"???"#)
 }
 
-async fn check_docker(Path(name): Path<String>) -> impl IntoResponse {
+async fn check_docker(Path(name): Path<String>, req: Request<Body>, args: Args) -> impl IntoResponse {
+    if let Some(r) = auth(req, args).await {
+        return r
+    }
+
     let container_name = name.as_str();
 
     let out_status: String;
@@ -293,7 +298,11 @@ async fn check_docker(Path(name): Path<String>) -> impl IntoResponse {
     );
 }
 
-async fn check_service(Path(name): Path<String>) -> impl IntoResponse {
+async fn check_service(Path(name): Path<String>, req: Request<Body>, args: Args) -> impl IntoResponse {
+    if let Some(r) = auth(req, args).await {
+        return r
+    }
+
     let service_name = name.as_str();
 
     let cmdargs = vec!(
@@ -509,8 +518,15 @@ async fn check_service(Path(name): Path<String>) -> impl IntoResponse {
     );
 }
 
-async fn check_source_rcon(Path(name): Path<String>, address: String, pw: String) -> impl IntoResponse {
+async fn check_source_rcon(Path(name): Path<String>, req: Request<Body>, args: Args) -> impl IntoResponse {
+    if let Some(r) = auth(req, args.clone()).await {
+        return r
+    }
+
     let server_name = name.as_str();
+
+    let address = args.source_rcon_address;
+    let pw = args.source_rcon_pass;
 
     let remote_addr: SocketAddr = match address.parse() {
         Err(e) => {
@@ -741,6 +757,25 @@ async fn check_source_rcon(Path(name): Path<String>, address: String, pw: String
             }
         )),
     );
+}
+
+async fn auth(req: Request<Body>, args: Args) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if args.auth_user.is_empty() && args.auth_pass.is_empty() {
+        return None
+    }
+
+    let auth_header = match req.headers().get(axum::http::header::AUTHORIZATION).and_then(|header| header.to_str().ok()) {
+            None => return Some((StatusCode::UNAUTHORIZED, Json(json!({"err": "No auth header supplied"})))),
+            Some(v) => v,
+        };
+
+    let expected = format!("Basic {}", base64::encode(format!("{}:{}", args.auth_user, args.auth_pass)));
+
+    if auth_header != expected {
+        return Some((StatusCode::UNAUTHORIZED, Json(json!({"expected": expected}))));
+    }
+
+    return None
 }
 
 fn cmd(f: &str, args: Vec<&str>) -> (::std::process::Command, String) {
