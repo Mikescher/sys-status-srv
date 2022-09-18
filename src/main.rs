@@ -43,7 +43,7 @@ struct Args {
     #[clap(long, default_value = "")]
     source_rcon_pass: String,
 
-    #[clap(long, default_value = "localhost:27015")]
+    #[clap(long, default_value = "127.0.0.1:27015")]
     source_rcon_address: String,
 }
 
@@ -765,14 +765,14 @@ async fn auth(req: Request<Body>, args: Args) -> Option<(StatusCode, Json<serde_
     }
 
     let auth_header = match req.headers().get(axum::http::header::AUTHORIZATION).and_then(|header| header.to_str().ok()) {
-            None => return Some((StatusCode::UNAUTHORIZED, Json(json!({"err": "No auth header supplied"})))),
+            None => return Some((StatusCode::UNAUTHORIZED, Json(json!({"error":"NO_AUTH", "info": "No auth header supplied"})))),
             Some(v) => v,
         };
 
     let expected = format!("Basic {}", base64::encode(format!("{}:{}", args.auth_user, args.auth_pass)));
 
     if auth_header != expected {
-        return Some((StatusCode::UNAUTHORIZED, Json(json!({"expected": expected}))));
+        return Some((StatusCode::UNAUTHORIZED, Json(json!({"error":"AUTH_FAILURE", "info": "Failed to validate auth header"}))));
     }
 
     return None

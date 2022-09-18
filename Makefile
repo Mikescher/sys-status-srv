@@ -2,16 +2,19 @@ prog := sys-status-srv
 
 debug ?=
 
-$(info debug is $(debug))
-
 ifdef debug
   release :=
+  flags :=
 else
-  release :=--release
+  release :=--release --target x86_64-unknown-linux-gnu
+  flags := -C target-feature=+crt-static
 endif
 
-build:
-	cargo build $(release)
+build:	
+	RUSTFLAGS='$(flags)' cargo build $(release)
+
+clean:	
+	cargo clean
 
 help:
 	@echo "usage: make $(prog) [debug=1]"
